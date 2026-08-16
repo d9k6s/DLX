@@ -47,7 +47,7 @@ func InitConfig() *Config {
 	flag.IntVar(&cfg.Port, "p", cfg.Port, "set up the port to listen on")
 
 	// DL Session flag
-	flag.StringVar(&cfg.DlSession, "s", "", "set the dl-session for /v1/translate endpoint")
+	flag.StringVar(&cfg.DlSession, "s", "", "set the DeepL Pro OAuth Bearer access token for /v1/translate endpoint")
 	if cfg.DlSession == "" {
 		if dlSession, ok := os.LookupEnv("DL_SESSION"); ok {
 			cfg.DlSession = dlSession

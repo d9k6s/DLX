@@ -74,6 +74,13 @@ type PayloadAPI struct {
 	TagHandling string   `json:"tag_handling"`
 }
 
+// hasProAccessToken only checks whether credentials were provided. Token
+// format, expiry, audience, and account entitlement are validated upstream.
+// OAuth access tokens may be JWTs and therefore contain dots.
+func hasProAccessToken(token string) bool {
+	return token != ""
+}
+
 func Router(cfg *Config) *gin.Engine {
 	// Set Proxy
 	proxyURL := os.Getenv("PROXY")
@@ -192,16 +199,10 @@ func Router(cfg *Config) *gin.Engine {
 			dlSession = strings.Replace(cookie, "dl_session=", "", -1)
 		}
 
-		if dlSession == "" {
+		if !hasProAccessToken(dlSession) {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"code":    http.StatusUnauthorized,
 				"message": "No dl_session Found",
-			})
-			return
-		} else if strings.Contains(dlSession, ".") {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Your account is not a Pro account. Please upgrade your account or switch to a different account.",
 			})
 			return
 		}
