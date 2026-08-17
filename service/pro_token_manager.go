@@ -18,11 +18,11 @@ import (
 )
 
 const (
-	deepLOAuthTokenEndpoint = "https://w.deepl.com/oidc/token"
-	deepLOAuthClientID      = "chromeExtension"
-	proTokenRefreshSkew     = time.Minute
-	proTokenRefreshTimeout  = 15 * time.Second
-	maxTokenResponseSize    = 1 << 20
+	deepLOAuthDiscoveryEndpoint = "https://auth.deepl.com/.well-known/openid-configuration"
+	deepLOAuthClientID          = "chromeExtension"
+	proTokenRefreshSkew         = time.Minute
+	proTokenRefreshTimeout      = 15 * time.Second
+	maxTokenResponseSize        = 1 << 20
 )
 
 type proTokenRefreshReason string
@@ -48,11 +48,12 @@ type persistedProTokenState struct {
 type proTokenManager struct {
 	mu sync.Mutex
 
-	client        *http.Client
-	tokenEndpoint string
-	clientID      string
-	stateFile     string
-	now           func() time.Time
+	client            *http.Client
+	discoveryEndpoint string
+	tokenEndpoint     string
+	clientID          string
+	stateFile         string
+	now               func() time.Time
 
 	accessToken  string
 	refreshToken string
@@ -86,12 +87,12 @@ func newProTokenManager(cfg *Config) (*proTokenManager, error) {
 		client: &http.Client{
 			Timeout: proTokenRefreshTimeout,
 		},
-		tokenEndpoint: deepLOAuthTokenEndpoint,
-		clientID:      deepLOAuthClientID,
-		stateFile:     cfg.DlTokenStore,
-		now:           time.Now,
-		accessToken:   cfg.DlSession,
-		refreshToken:  cfg.DlRefreshToken,
+		discoveryEndpoint: deepLOAuthDiscoveryEndpoint,
+		clientID:          deepLOAuthClientID,
+		stateFile:         cfg.DlTokenStore,
+		now:               time.Now,
+		accessToken:       cfg.DlSession,
+		refreshToken:      cfg.DlRefreshToken,
 	}
 	if expiresAt, ok := jwtExpiry(cfg.DlSession); ok {
 		m.expiresAt = expiresAt
@@ -200,12 +201,16 @@ func (m *proTokenManager) refreshLocked(ctx context.Context, reason proTokenRefr
 	}()
 
 	previousRefreshToken := m.refreshToken
+	tokenEndpoint, err := m.resolveTokenEndpoint(ctx)
+	if err != nil {
+		return "", fmt.Errorf("discover DeepL OAuth token endpoint: %w", err)
+	}
 	form := url.Values{
 		"client_id":     {m.clientID},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {m.refreshToken},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.tokenEndpoint, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", &tokenRefreshError{err: err}
 	}
@@ -279,6 +284,42 @@ func (m *proTokenManager) refreshLocked(ctx context.Context, reason proTokenRefr
 		m.stateFile != "",
 	)
 	return m.accessToken, nil
+}
+
+func (m *proTokenManager) resolveTokenEndpoint(ctx context.Context) (string, error) {
+	if m.tokenEndpoint != "" {
+		return m.tokenEndpoint, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.discoveryEndpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("OIDC discovery failed with status %d", resp.StatusCode)
+	}
+
+	var metadata struct {
+		TokenEndpoint string `json:"token_endpoint"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxTokenResponseSize)).Decode(&metadata); err != nil {
+		return "", errors.New("invalid OIDC discovery response")
+	}
+	endpointURL, err := url.Parse(metadata.TokenEndpoint)
+	if err != nil || endpointURL.Scheme != "https" || endpointURL.Host == "" {
+		return "", errors.New("OIDC discovery returned an invalid token endpoint")
+	}
+
+	m.tokenEndpoint = endpointURL.String()
+	log.Printf("[DeepL OAuth] OIDC discovery resolved token endpoint (token_endpoint=%s).", m.tokenEndpoint)
+	return m.tokenEndpoint, nil
 }
 
 func formatTokenExpiry(expiresAt time.Time) string {

@@ -93,11 +93,13 @@ volumes:
 ```
 
 When `DL_REFRESH_TOKEN` is configured, DLX follows the current DeepL Chrome
-extension flow: it refreshes through `https://w.deepl.com/oidc/token` with
+extension flow: it discovers `token_endpoint` from
+`https://auth.deepl.com/.well-known/openid-configuration`, refreshes with
 `client_id=chromeExtension`, refreshes tokens that have less than 60 seconds
-remaining, and retries one translation after an upstream `401`. Rotated access,
-refresh, and ID tokens are written atomically to `DL_TOKEN_STORE` with owner-only
-permissions so they survive container restarts.
+remaining, and retries one translation after an upstream `401`. Only an HTTPS
+token endpoint is accepted. Rotated access, refresh, and ID tokens are written
+atomically to `DL_TOKEN_STORE` with owner-only permissions so they survive
+container restarts.
 
 When the state file does not exist yet, the first Pro request immediately
 refreshes and persists the supplied token generation. Use a dedicated DeepL

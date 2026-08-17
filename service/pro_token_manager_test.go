@@ -151,6 +151,77 @@ func TestProTokenManagerRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	}
 }
 
+func TestProTokenManagerDiscoversTokenEndpoint(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	newAccessToken := testJWT(now.Add(20 * time.Minute))
+	var discoveryCalls atomic.Int32
+	var tokenCalls atomic.Int32
+	var server *httptest.Server
+
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			discoveryCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"token_endpoint": server.URL + "/token",
+			})
+		case "/token":
+			tokenCalls.Add(1)
+			writeTokenResponse(t, w, newAccessToken, "refresh-new", "id-new")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	m, err := newProTokenManager(&Config{
+		DlSession:      testJWT(now.Add(-time.Minute)),
+		DlRefreshToken: "refresh-old",
+	})
+	if err != nil {
+		t.Fatalf("newProTokenManager: %v", err)
+	}
+	m.client = server.Client()
+	m.discoveryEndpoint = server.URL + "/.well-known/openid-configuration"
+	m.now = func() time.Time { return now }
+
+	got, err := m.getAccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("getAccessToken: %v", err)
+	}
+	if got != newAccessToken {
+		t.Fatal("access token was not returned from the discovered endpoint")
+	}
+	if discoveryCalls.Load() != 1 || tokenCalls.Load() != 1 {
+		t.Fatalf("calls = discovery:%d token:%d, want 1 each", discoveryCalls.Load(), tokenCalls.Load())
+	}
+}
+
+func TestProTokenManagerRejectsInsecureDiscoveredTokenEndpoint(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"token_endpoint": "http://auth.example.invalid/token",
+		})
+	}))
+	defer server.Close()
+
+	m, err := newProTokenManager(&Config{
+		DlSession:      "expired-access-token",
+		DlRefreshToken: "refresh-token",
+	})
+	if err != nil {
+		t.Fatalf("newProTokenManager: %v", err)
+	}
+	m.client = server.Client()
+	m.discoveryEndpoint = server.URL
+
+	if _, err := m.getAccessToken(context.Background()); err == nil || !strings.Contains(err.Error(), "invalid token endpoint") {
+		t.Fatalf("getAccessToken error = %v, want invalid token endpoint", err)
+	}
+}
+
 func TestProTokenManagerCoalescesConcurrentRefresh(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	newAccessToken := testJWT(now.Add(20 * time.Minute))
