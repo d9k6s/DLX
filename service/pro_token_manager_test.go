@@ -80,7 +80,7 @@ func TestProTokenManagerRefreshesAndPersistsRotatedTokens(t *testing.T) {
 
 	stateFile := filepath.Join(t.TempDir(), "oauth.json")
 	m, err := newProTokenManager(&Config{
-		DlSession:      testJWT(now.Add(-time.Minute)),
+		DlSession:      testJWT(now.Add(20 * time.Minute)),
 		DlRefreshToken: "refresh-old",
 		DlTokenStore:   stateFile,
 	})

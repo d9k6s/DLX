@@ -99,6 +99,11 @@ remaining, and retries one translation after an upstream `401`. Rotated access,
 refresh, and ID tokens are written atomically to `DL_TOKEN_STORE` with owner-only
 permissions so they survive container restarts.
 
+When the state file does not exist yet, the first Pro request immediately
+refreshes and persists the supplied token generation. Use a dedicated DeepL
+login session for DLX; allowing the browser extension and DLX to rotate the
+same refresh token can invalidate one of them.
+
 `DL_TOKEN_STORE` is strongly recommended because DeepL rotates refresh tokens.
 Do not commit any OAuth token or the state file to source control, and do not
 put `Bearer ` in front of `DL_SESSION`.

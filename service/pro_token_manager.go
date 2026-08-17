@@ -89,6 +89,12 @@ func newProTokenManager(cfg *Config) (*proTokenManager, error) {
 
 	state, err := readProTokenState(m.stateFile)
 	if errors.Is(err, os.ErrNotExist) {
+		// Claim and persist the supplied refresh-token generation on the first
+		// Pro request. Waiting for the access token to expire would leave the
+		// browser extension and DLX racing to rotate the same refresh token.
+		if m.refreshToken != "" {
+			m.expiresAt = time.Time{}
+		}
 		return m, nil
 	}
 	if err != nil {
