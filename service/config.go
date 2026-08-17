@@ -19,11 +19,13 @@ import (
 )
 
 type Config struct {
-	IP        string
-	Port      int
-	Token     string
-	DlSession string
-	Proxy     string
+	IP             string
+	Port           int
+	Token          string
+	DlSession      string
+	DlRefreshToken string
+	DlTokenStore   string
+	Proxy          string
 }
 
 func InitConfig() *Config {
@@ -52,6 +54,17 @@ func InitConfig() *Config {
 		if dlSession, ok := os.LookupEnv("DL_SESSION"); ok {
 			cfg.DlSession = dlSession
 		}
+	}
+
+	// DeepL OAuth refresh token. Environment-only so the long-lived secret is
+	// not exposed through process arguments.
+	if dlRefreshToken, ok := os.LookupEnv("DL_REFRESH_TOKEN"); ok {
+		cfg.DlRefreshToken = dlRefreshToken
+	}
+
+	// Optional state file used to persist rotated OAuth tokens across restarts.
+	if dlTokenStore, ok := os.LookupEnv("DL_TOKEN_STORE"); ok {
+		cfg.DlTokenStore = dlTokenStore
 	}
 
 	// Access token flag

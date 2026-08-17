@@ -69,6 +69,40 @@ curl -X POST http://localhost:1188/translate \
   -d '{"text": "Hello, world!", "source_lang": "EN", "target_lang": "ZH"}'
 ```
 
+### DeepL Pro OAuth token lifecycle
+
+`/v1/translate` uses a DeepL Pro OAuth access token. A static access token can
+still be supplied through `DL_SESSION`. To keep Pro translation working after
+that short-lived token expires, also provide its refresh token and a persistent
+state file:
+
+```yaml
+services:
+  deeplx:
+    image: ghcr.io/d9k6s/deeplx:latest
+    environment:
+      TOKEN: "replace-with-your-DLX-access-token"
+      DL_SESSION: "replace-with-the-current-DeepL-access-token"
+      DL_REFRESH_TOKEN: "replace-with-the-DeepL-refresh-token"
+      DL_TOKEN_STORE: "/data/deepl-oauth.json"
+    volumes:
+      - deeplx-oauth:/data
+
+volumes:
+  deeplx-oauth:
+```
+
+When `DL_REFRESH_TOKEN` is configured, DLX follows the current DeepL Chrome
+extension flow: it refreshes through `https://w.deepl.com/oidc/token` with
+`client_id=chromeExtension`, refreshes tokens that have less than 60 seconds
+remaining, and retries one translation after an upstream `401`. Rotated access,
+refresh, and ID tokens are written atomically to `DL_TOKEN_STORE` with owner-only
+permissions so they survive container restarts.
+
+`DL_TOKEN_STORE` is strongly recommended because DeepL rotates refresh tokens.
+Do not commit any OAuth token or the state file to source control, and do not
+put `Bearer ` in front of `DL_SESSION`.
+
 ## Discussion Group
 [Telegram Group](https://t.me/+8KDGHKJCxEVkNzll)
 

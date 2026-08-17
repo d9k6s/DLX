@@ -13,6 +13,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -101,6 +102,13 @@ func Router(cfg *Config) *gin.Engine {
 		fmt.Println("Access token is set.")
 	}
 
+	proTokens, proTokenInitErr := newProTokenManager(cfg)
+	if proTokenInitErr != nil {
+		log.Printf("Failed to load DeepL OAuth token state: %v", proTokenInitErr)
+	} else if proTokens.canRefresh() && cfg.DlTokenStore == "" {
+		log.Println("DeepL OAuth refresh is enabled without DL_TOKEN_STORE; rotated tokens will not survive a restart.")
+	}
+
 	r := gin.Default()
 	r.Use(cors.Default())
 
@@ -184,8 +192,6 @@ func Router(cfg *Config) *gin.Engine {
 		tagHandling := req.TagHandling
 		proxyURL := cfg.Proxy
 
-		dlSession := cfg.DlSession
-
 		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":    http.StatusBadRequest,
@@ -194,9 +200,29 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		cookie := c.GetHeader("Cookie")
-		if cookie != "" {
-			dlSession = strings.Replace(cookie, "dl_session=", "", -1)
+		cookieToken := ""
+		if cookie := c.GetHeader("Cookie"); cookie != "" {
+			cookieToken = strings.Replace(cookie, "dl_session=", "", -1)
+		}
+
+		if proTokenInitErr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"code":    http.StatusServiceUnavailable,
+				"message": "DeepL Pro authentication state could not be loaded",
+			})
+			return
+		}
+
+		dlSession := cookieToken
+		if dlSession == "" {
+			var err error
+			dlSession, err = proTokens.getAccessToken(c.Request.Context())
+			if err != nil && !errors.Is(err, errNoProCredentials) {
+				status, message := proTokenFailure(err)
+				log.Printf("Failed to refresh DeepL OAuth access token: %v", err)
+				c.JSON(status, gin.H{"code": status, "message": message})
+				return
+			}
 		}
 
 		if !hasProAccessToken(dlSession) {
@@ -207,7 +233,10 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
+		translateWithToken := func(token string) (translate.DLXTranslationResult, error) {
+			return translate.TranslateByDLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, token)
+		}
+		result, err := translateWithToken(dlSession)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -215,6 +244,25 @@ func Router(cfg *Config) *gin.Engine {
 				"message": "Translation failed",
 			})
 			return
+		}
+
+		if result.Code == http.StatusUnauthorized && cookieToken == "" && proTokens.canRefresh() {
+			refreshedToken, refreshErr := proTokens.refreshAfterUnauthorized(c.Request.Context(), dlSession)
+			if refreshErr != nil {
+				status, message := proTokenFailure(refreshErr)
+				log.Printf("Failed to refresh rejected DeepL OAuth access token: %v", refreshErr)
+				c.JSON(status, gin.H{"code": status, "message": message})
+				return
+			}
+			result, err = translateWithToken(refreshedToken)
+			if err != nil {
+				log.Printf("Translation failed after DeepL OAuth refresh: %s", err)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"code":    http.StatusInternalServerError,
+					"message": "Translation failed",
+				})
+				return
+			}
 		}
 
 		if result.Code == http.StatusOK {

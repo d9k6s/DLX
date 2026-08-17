@@ -5,5 +5,12 @@ services:
     ports:
       - "1188:1188"
     # environment:
-      # - TOKEN=helloworld
-      # - DL_SESSION=xxxxxx
+    #   TOKEN: "replace-with-your-DLX-access-token"
+    #   DL_SESSION: "replace-with-the-current-DeepL-access-token"
+    #   DL_REFRESH_TOKEN: "replace-with-the-DeepL-refresh-token"
+    #   DL_TOKEN_STORE: "/data/deepl-oauth.json"
+    volumes:
+      - deeplx-oauth:/data
+
+volumes:
+  deeplx-oauth:

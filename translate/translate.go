@@ -479,6 +479,12 @@ func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, pro
 	switch status {
 	case http.StatusOK:
 		// fall through to body parsing
+	case http.StatusUnauthorized:
+		return DLXTranslationResult{
+			ID:      id,
+			Code:    http.StatusUnauthorized,
+			Message: "DeepL Pro access token is invalid or expired",
+		}, nil
 	case http.StatusTooManyRequests:
 		return DLXTranslationResult{
 			ID:      id,
