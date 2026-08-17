@@ -108,6 +108,14 @@ same refresh token can invalidate one of them.
 Do not commit any OAuth token or the state file to source control, and do not
 put `Bearer ` in front of `DL_SESSION`.
 
+Docker logs report the OAuth lifecycle without exposing credential values. They
+include whether access and refresh tokens are configured, whether persisted
+state was loaded, refresh start/success/failure events, the refresh reason,
+expiry time, rotation/persistence status, and a sanitized OAuth error code when
+DeepL rejects a refresh. Request logging also replaces the value of a `token`
+query parameter with `REDACTED`. Prefer the `Authorization: Bearer` header so
+the DLX access token is not placed in URLs outside the application either.
+
 ## Discussion Group
 [Telegram Group](https://t.me/+8KDGHKJCxEVkNzll)
 

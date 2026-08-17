@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,11 +14,29 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func captureStandardLog(run func()) string {
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	defer func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	}()
+	run()
+	return output.String()
+}
 
 func testJWT(expiresAt time.Time) string {
 	payload, _ := json.Marshal(map[string]int64{"exp": expiresAt.Unix()})
@@ -244,5 +264,103 @@ func TestWriteProTokenStateReplacesExistingState(t *testing.T) {
 	}
 	if got.AccessToken != second.AccessToken || got.RefreshToken != second.RefreshToken {
 		t.Fatalf("state was not replaced: %+v", got)
+	}
+}
+
+func TestProTokenManagerLogsRefreshLifecycleWithoutCredentials(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	oldAccessToken := testJWT(now.Add(20 * time.Minute))
+	newAccessToken := testJWT(now.Add(40 * time.Minute))
+	oldRefreshToken := "refresh-secret-old"
+	newRefreshToken := "refresh-secret-new"
+	idToken := "id-secret-new"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeTokenResponse(t, w, newAccessToken, newRefreshToken, idToken)
+	}))
+	defer server.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "oauth.json")
+	m, err := newProTokenManager(&Config{
+		DlSession:      oldAccessToken,
+		DlRefreshToken: oldRefreshToken,
+		DlTokenStore:   stateFile,
+	})
+	if err != nil {
+		t.Fatalf("newProTokenManager: %v", err)
+	}
+	m.tokenEndpoint = server.URL
+	m.now = func() time.Time { return now }
+
+	var refreshErr error
+	logs := captureStandardLog(func() {
+		m.logConfiguration()
+		_, refreshErr = m.getAccessToken(context.Background())
+	})
+	if refreshErr != nil {
+		t.Fatalf("getAccessToken: %v", refreshErr)
+	}
+
+	for _, want := range []string{
+		"access token is configured",
+		"refresh token is configured",
+		"no usable persisted token state was loaded",
+		"refresh started (reason=bootstrap)",
+		"refresh succeeded (reason=bootstrap",
+		"refresh_token_rotated=true",
+		"persisted=true",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, logs)
+		}
+	}
+	for _, secret := range []string{oldAccessToken, newAccessToken, oldRefreshToken, newRefreshToken, idToken} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("logs contain credential value %q", secret)
+		}
+	}
+}
+
+func TestProTokenManagerLogsSanitizedOAuthFailure(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	refreshToken := "refresh-secret"
+	errorDescription := "refresh-secret was rejected"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "invalid_grant",
+			"error_description": errorDescription,
+		})
+	}))
+	defer server.Close()
+
+	m, err := newProTokenManager(&Config{
+		DlSession:      testJWT(now.Add(-time.Minute)),
+		DlRefreshToken: refreshToken,
+	})
+	if err != nil {
+		t.Fatalf("newProTokenManager: %v", err)
+	}
+	m.tokenEndpoint = server.URL
+	m.now = func() time.Time { return now }
+
+	var refreshErr error
+	logs := captureStandardLog(func() {
+		_, refreshErr = m.getAccessToken(context.Background())
+	})
+	if refreshErr == nil {
+		t.Fatal("getAccessToken unexpectedly succeeded")
+	}
+	for _, want := range []string{"reason=expiring", "status=400", "oauth_error=invalid_grant"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("logs do not contain %q:\n%s", want, logs)
+		}
+	}
+	for _, secret := range []string{refreshToken, errorDescription} {
+		if strings.Contains(logs, secret) {
+			t.Errorf("logs contain sensitive OAuth response content %q", secret)
+		}
 	}
 }

@@ -82,6 +82,37 @@ func hasProAccessToken(token string) bool {
 	return token != ""
 }
 
+func redactSensitiveQuery(path string) string {
+	queryStart := strings.IndexByte(path, '?')
+	if queryStart < 0 {
+		return path
+	}
+
+	query, err := url.ParseQuery(path[queryStart+1:])
+	if err != nil {
+		return path[:queryStart] + "?[REDACTED]"
+	}
+	for key := range query {
+		if strings.EqualFold(key, "token") {
+			query.Set(key, "REDACTED")
+		}
+	}
+	return path[:queryStart] + "?" + query.Encode()
+}
+
+func safeGinLogFormatter(param gin.LogFormatterParams) string {
+	return fmt.Sprintf(
+		"[GIN] %v | %3d | %13v | %15s | %-7s %s%s\n",
+		param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+		param.StatusCode,
+		param.Latency,
+		param.ClientIP,
+		param.Method,
+		redactSensitiveQuery(param.Path),
+		param.ErrorMessage,
+	)
+}
+
 func Router(cfg *Config) *gin.Engine {
 	// Set Proxy
 	proxyURL := os.Getenv("PROXY")
@@ -99,17 +130,21 @@ func Router(cfg *Config) *gin.Engine {
 	}
 
 	if cfg.Token != "" {
-		fmt.Println("Access token is set.")
+		fmt.Println("[DLX API] access token protection is enabled.")
 	}
 
 	proTokens, proTokenInitErr := newProTokenManager(cfg)
 	if proTokenInitErr != nil {
 		log.Printf("Failed to load DeepL OAuth token state: %v", proTokenInitErr)
-	} else if proTokens.canRefresh() && cfg.DlTokenStore == "" {
-		log.Println("DeepL OAuth refresh is enabled without DL_TOKEN_STORE; rotated tokens will not survive a restart.")
+	} else {
+		proTokens.logConfiguration()
+		if proTokens.canRefresh() && cfg.DlTokenStore == "" {
+			log.Println("[DeepL OAuth] warning: DL_TOKEN_STORE is not configured; rotated tokens will not survive a restart.")
+		}
 	}
 
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.LoggerWithFormatter(safeGinLogFormatter), gin.Recovery())
 	r.Use(cors.Default())
 
 	// Defining the root endpoint which returns the project details
@@ -219,7 +254,6 @@ func Router(cfg *Config) *gin.Engine {
 			dlSession, err = proTokens.getAccessToken(c.Request.Context())
 			if err != nil && !errors.Is(err, errNoProCredentials) {
 				status, message := proTokenFailure(err)
-				log.Printf("Failed to refresh DeepL OAuth access token: %v", err)
 				c.JSON(status, gin.H{"code": status, "message": message})
 				return
 			}
@@ -250,7 +284,6 @@ func Router(cfg *Config) *gin.Engine {
 			refreshedToken, refreshErr := proTokens.refreshAfterUnauthorized(c.Request.Context(), dlSession)
 			if refreshErr != nil {
 				status, message := proTokenFailure(refreshErr)
-				log.Printf("Failed to refresh rejected DeepL OAuth access token: %v", refreshErr)
 				c.JSON(status, gin.H{"code": status, "message": message})
 				return
 			}
