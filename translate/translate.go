@@ -45,26 +45,26 @@ import (
 // Request shape reverse-engineered from DeepL iOS 26.42 (build 5443737,
 // bundle com.linguee.DeepLMobileTranslator, IPA Info.plist + ItaClient.framework):
 //
-//   Transport
-//     ItaClient oneshot uses Ktor Darwin engine
-//     (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
-//     URLSession TLS. We approximate that ClientHello with utls HelloIOS.
+//	Transport
+//	  ItaClient oneshot uses Ktor Darwin engine
+//	  (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
+//	  URLSession TLS. We approximate that ClientHello with utls HelloIOS.
 //
-//   Free URL   → https://oneshot-free.www.deepl.com/v1/translate
-//   Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
-//                (we keep oneshot-pro.www as the free-tier Pro fallback)
+//	Free URL   → https://oneshot-free.www.deepl.com/v1/translate
+//	Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
+//	             (we keep oneshot-pro.www as the free-tier Pro fallback)
 //
-//   Headers (ClientInfos.appHeaders + LoginNone):
-//     Authorization: None          (ItaClient.LoginNone)
-//     x-app-os-version             (UIDevice.systemVersion)
-//     x-app-instance-id            (stable install UUID)
-//     x-app-session-id             (session UUID)
-//     User-Agent                   (URLSession / CFNetwork product form)
-//     Accept / Accept-Encoding     (URLSession defaults)
+//	Headers (ClientInfos.appHeaders + LoginNone):
+//	  Authorization: None          (ItaClient.LoginNone)
+//	  x-app-os-version             (UIDevice.systemVersion)
+//	  x-app-instance-id            (stable install UUID)
+//	  x-app-session-id             (session UUID)
+//	  User-Agent                   (URLSession / CFNetwork product form)
+//	  Accept / Accept-Encoding     (URLSession defaults)
 //
-//   Body (ItaClient OneShotTranslationRequestDto + AppInformation):
-//     text[], target_lang, source_lang?, usage_type, app_information
-//     usage_type ∈ {translate, ocr, voiceforconversations}
+//	Body (ItaClient OneShotTranslationRequestDto + AppInformation):
+//	  text[], target_lang, source_lang?, usage_type, app_information
+//	  usage_type ∈ {translate, ocr, voiceforconversations}
 //
 // DeepL rate-limits / temporarily bans clients whose TLS + UA + app_information
 // story is inconsistent (e.g. iOS TLS fingerprint + "iOS 27.0" in the UA when
@@ -95,6 +95,11 @@ const (
 	// upstream and give the caller a faster error.
 	maxFreeTextLength = 1500
 
+	// DeepL Chrome extension 1.97.0 enforces this per-source-text limit
+	// before calling the authenticated oneshot endpoint. JavaScript
+	// String.length counts UTF-16 code units, so v1 uses the same measure.
+	maxProTextLength = 300000
+
 	// oneshotTimeout caps how long we wait on a single translate request.
 	oneshotTimeout = 20 * time.Second
 
@@ -102,6 +107,10 @@ const (
 	// cookie jar. Cookies are best-effort; skip a slow warmup rather than
 	// block the first translation.
 	warmupTimeout = 5 * time.Second
+
+	// maxOneshotResponseSize prevents a broken or hostile upstream/proxy
+	// from making the process buffer an unbounded response in memory.
+	maxOneshotResponseSize = 4 << 20
 )
 
 // instanceID mirrors the UUID the iOS app persists for analytics /
@@ -171,7 +180,7 @@ func newInstanceID() string {
 // regional default (en-US, pt-BR).
 var targetLangMap = map[string]string{
 	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "DE-CH": "de-CH",
-	"EL": "el",
+	"EL":    "el",
 	"EN-GB": "en-GB", "EN-US": "en-US",
 	"ES": "es", "ES-419": "es-419", "ET": "et", "FI": "fi", "FR": "fr", "FR-CA": "fr-CA",
 	"HE": "he", "HU": "hu", "ID": "id", "IT": "it", "JA": "ja", "KO": "ko",
@@ -261,6 +270,39 @@ func sortedKeys(m map[string]string) string {
 	return strings.Join(keys, ", ")
 }
 
+func utf16CodeUnitCount(text string) int {
+	count := 0
+	for _, char := range text {
+		count++
+		if char > 0xffff {
+			count++
+		}
+	}
+	return count
+}
+
+func validateOneshotTextLength(text string, pro bool) error {
+	if pro {
+		if count := utf16CodeUnitCount(text); count > maxProTextLength {
+			return fmt.Errorf(
+				"text exceeds maximum length: %d UTF-16 code units (Pro oneshot limit is %d)",
+				count,
+				maxProTextLength,
+			)
+		}
+		return nil
+	}
+
+	if count := utf8.RuneCountInString(text); count > maxFreeTextLength {
+		return fmt.Errorf(
+			"text exceeds maximum length: %d characters (anonymous oneshot limit is %d)",
+			count,
+			maxFreeTextLength,
+		)
+	}
+	return nil
+}
+
 // appInformation matches ItaClient.AppInformation (os, os_version,
 // app_version, app_build, instance_id) as serialized by the iOS client.
 type appInformation struct {
@@ -343,7 +385,7 @@ func iosUserAgent() string {
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
 // that header puts the request on a different server-side auth branch.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
 		return gjson.Result{}, 0, err
@@ -356,6 +398,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 	}
 
 	resp, err := client.R().
+		SetContext(ctx).
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Authorization", authValue).
@@ -385,13 +428,18 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 		defer gr.Close()
 		reader = gr
 	case "deflate":
-		reader = flate.NewReader(resp.Body)
+		fr := flate.NewReader(resp.Body)
+		defer fr.Close()
+		reader = fr
 	case "br":
 		reader = brotli.NewReader(resp.Body)
 	}
-	raw, err := io.ReadAll(reader)
+	raw, err := io.ReadAll(io.LimitReader(reader, maxOneshotResponseSize+1))
 	if err != nil {
 		return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+	}
+	if len(raw) > maxOneshotResponseSize {
+		return gjson.Result{}, resp.StatusCode, fmt.Errorf("upstream response exceeds %d bytes", maxOneshotResponseSize)
 	}
 	return gjson.ParseBytes(raw), resp.StatusCode, nil
 }
@@ -401,6 +449,13 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 // verbatim as the Bearer token (i.e. it must be an OAuth access token,
 // not the legacy dl_session cookie).
 func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
+	return TranslateByDLXContext(context.Background(), sourceLang, targetLang, text, tagHandling, proxyURL, dlSession)
+}
+
+// TranslateByDLXContext is TranslateByDLX with caller cancellation propagated
+// to the upstream request. HTTP handlers should use this form so disconnected
+// clients do not leave a DeepL request consuming resources until timeout.
+func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
 	if text == "" {
 		return DLXTranslationResult{
 			Code:    http.StatusNotFound,
@@ -423,10 +478,10 @@ func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, pro
 		}, nil
 	}
 
-	if n := utf8.RuneCountInString(text); n > maxFreeTextLength {
+	if err := validateOneshotTextLength(text, dlSession != ""); err != nil {
 		return DLXTranslationResult{
 			Code:    http.StatusRequestEntityTooLarge,
-			Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", n, maxFreeTextLength),
+			Message: err.Error(),
 		}, nil
 	}
 
@@ -457,7 +512,7 @@ func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, pro
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL)
+	result, status, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL)
 	if err != nil {
 		// Map upstream timeouts to 504 so callers can distinguish "DeepL
 		// took too long" from other 503 failure modes (DNS, TLS, etc.).
@@ -490,6 +545,12 @@ func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, pro
 			ID:      id,
 			Code:    http.StatusTooManyRequests,
 			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
+		}, nil
+	case http.StatusRequestEntityTooLarge:
+		return DLXTranslationResult{
+			ID:      id,
+			Code:    http.StatusRequestEntityTooLarge,
+			Message: "request exceeds the current DeepL oneshot payload limit",
 		}, nil
 	case http.StatusForbidden:
 		// iOS surfaces this as OneShot: Forbidden / AuthenticationFailed /

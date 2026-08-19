@@ -76,6 +76,13 @@ still be supplied through `DL_SESSION`. To keep Pro translation working after
 that short-lived token expires, also provide its refresh token and a persistent
 state file:
 
+The authenticated `/v1/translate` route accepts one source text up to 300,000
+UTF-16 code units, matching the client-side limit in DeepL's official Chrome
+extension. Supplementary characters such as emoji count as two units. The
+anonymous `/translate` and `/v2/translate` routes retain their 1,500-character
+limit. DeepL may still return `413` if its current upstream payload limit is
+lower.
+
 ```yaml
 services:
   deeplx:

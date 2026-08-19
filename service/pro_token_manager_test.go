@@ -70,6 +70,35 @@ func TestProTokenManagerKeepsStaticAccessTokenCompatibility(t *testing.T) {
 	}
 }
 
+func TestProTokenManagerUsesScopedProxyTransport(t *testing.T) {
+	defaultTransport := http.DefaultTransport
+	m, err := newProTokenManager(&Config{Proxy: "http://proxy.example:8080"})
+	if err != nil {
+		t.Fatalf("newProTokenManager: %v", err)
+	}
+	if http.DefaultTransport != defaultTransport {
+		t.Fatal("newProTokenManager mutated http.DefaultTransport")
+	}
+
+	transport, ok := m.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client transport type = %T, want *http.Transport", m.client.Transport)
+	}
+	proxy, err := transport.Proxy(httptest.NewRequest(http.MethodGet, "https://auth.deepl.com", nil))
+	if err != nil {
+		t.Fatalf("resolve proxy: %v", err)
+	}
+	if proxy.String() != "http://proxy.example:8080" {
+		t.Fatalf("proxy = %q, want http://proxy.example:8080", proxy)
+	}
+}
+
+func TestProTokenManagerRejectsInvalidProxyURL(t *testing.T) {
+	if _, err := newProTokenManager(&Config{Proxy: "localhost:8080"}); err == nil {
+		t.Fatal("newProTokenManager unexpectedly accepted proxy URL without scheme")
+	}
+}
+
 func TestProTokenManagerRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	newAccessToken := testJWT(now.Add(20 * time.Minute))

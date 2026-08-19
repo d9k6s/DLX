@@ -83,10 +83,12 @@ func (e *tokenRefreshError) Unwrap() error {
 }
 
 func newProTokenManager(cfg *Config) (*proTokenManager, error) {
+	client, err := newProHTTPClient(cfg.Proxy)
+	if err != nil {
+		return nil, fmt.Errorf("configure DeepL OAuth HTTP client: %w", err)
+	}
 	m := &proTokenManager{
-		client: &http.Client{
-			Timeout: proTokenRefreshTimeout,
-		},
+		client:            client,
 		discoveryEndpoint: deepLOAuthDiscoveryEndpoint,
 		clientID:          deepLOAuthClientID,
 		stateFile:         cfg.DlTokenStore,
@@ -123,6 +125,29 @@ func newProTokenManager(cfg *Config) (*proTokenManager, error) {
 		m.stateLoaded = true
 	}
 	return m, nil
+}
+
+func newProHTTPClient(proxyURL string) (*http.Client, error) {
+	var transport http.RoundTripper = http.DefaultTransport
+
+	if proxyURL != "" {
+		defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+		if !ok {
+			return nil, errors.New("default HTTP transport has an unsupported type")
+		}
+		proxy, err := url.Parse(proxyURL)
+		if err != nil || proxy.Scheme == "" || proxy.Host == "" {
+			return nil, errors.New("invalid proxy URL")
+		}
+		proxyTransport := defaultTransport.Clone()
+		proxyTransport.Proxy = http.ProxyURL(proxy)
+		transport = proxyTransport
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   proTokenRefreshTimeout,
+	}, nil
 }
 
 func (m *proTokenManager) logConfiguration() {

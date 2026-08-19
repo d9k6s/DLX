@@ -18,7 +18,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -31,21 +30,7 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if cfg.Token != "" {
 			providedTokenInQuery := c.Query("token")
-			providedTokenInHeader := c.GetHeader("Authorization")
-
-			// Compatability with the Bearer token format
-			if providedTokenInHeader != "" {
-				parts := strings.Split(providedTokenInHeader, " ")
-				if len(parts) == 2 {
-					if parts[0] == "Bearer" || parts[0] == "DeepL-Auth-Key" {
-						providedTokenInHeader = parts[1]
-					} else {
-						providedTokenInHeader = ""
-					}
-				} else {
-					providedTokenInHeader = ""
-				}
-			}
+			providedTokenInHeader := authorizationToken(c.GetHeader("Authorization"))
 
 			if providedTokenInHeader != cfg.Token && providedTokenInQuery != cfg.Token {
 				c.JSON(http.StatusUnauthorized, gin.H{
@@ -59,6 +44,15 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func authorizationToken(header string) string {
+	parts := strings.Fields(header)
+	if len(parts) != 2 ||
+		(!strings.EqualFold(parts[0], "Bearer") && !strings.EqualFold(parts[0], "DeepL-Auth-Key")) {
+		return ""
+	}
+	return parts[1]
 }
 
 type PayloadFree struct {
@@ -80,6 +74,14 @@ type PayloadAPI struct {
 // OAuth access tokens may be JWTs and therefore contain dots.
 func hasProAccessToken(token string) bool {
 	return token != ""
+}
+
+func proAccessTokenFromCookie(r *http.Request) string {
+	cookie, err := r.Cookie("dl_session")
+	if err != nil {
+		return ""
+	}
+	return cookie.Value
 }
 
 func redactSensitiveQuery(path string) string {
@@ -114,21 +116,6 @@ func safeGinLogFormatter(param gin.LogFormatterParams) string {
 }
 
 func Router(cfg *Config) *gin.Engine {
-	// Set Proxy
-	proxyURL := os.Getenv("PROXY")
-	if proxyURL == "" {
-		proxyURL = cfg.Proxy
-	}
-	if proxyURL != "" {
-		proxy, err := url.Parse(proxyURL)
-		if err != nil {
-			log.Fatalf("Failed to parse proxy URL: %v", err)
-		}
-		http.DefaultTransport = &http.Transport{
-			Proxy: http.ProxyURL(proxy),
-		}
-	}
-
 	if cfg.Token != "" {
 		fmt.Println("[DLX API] access token protection is enabled.")
 	}
@@ -158,7 +145,7 @@ func Router(cfg *Config) *gin.Engine {
 	// Free API endpoint, No Pro Account required
 	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
 		req := PayloadFree{}
-		if err := c.BindJSON(&req); err != nil {
+		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":    http.StatusBadRequest,
 				"message": "Invalid request payload",
@@ -181,7 +168,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -213,7 +200,7 @@ func Router(cfg *Config) *gin.Engine {
 	// Pro API endpoint, Pro Account required
 	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {
 		req := PayloadFree{}
-		if err := c.BindJSON(&req); err != nil {
+		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":    http.StatusBadRequest,
 				"message": "Invalid request payload",
@@ -235,10 +222,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		cookieToken := ""
-		if cookie := c.GetHeader("Cookie"); cookie != "" {
-			cookieToken = strings.Replace(cookie, "dl_session=", "", -1)
-		}
+		cookieToken := proAccessTokenFromCookie(c.Request)
 
 		if proTokenInitErr != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -268,7 +252,7 @@ func Router(cfg *Config) *gin.Engine {
 		}
 
 		translateWithToken := func(token string) (translate.DLXTranslationResult, error) {
-			return translate.TranslateByDLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, token)
+			return translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, token)
 		}
 		result, err := translateWithToken(dlSession)
 		if err != nil {
@@ -333,7 +317,7 @@ func Router(cfg *Config) *gin.Engine {
 				TargetLang string   `json:"target_lang"`
 			}
 
-			if err := c.BindJSON(&jsonData); err != nil {
+			if err := c.ShouldBindJSON(&jsonData); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{
 					"code":    http.StatusBadRequest,
 					"message": "Invalid request payload",
@@ -345,7 +329,7 @@ func Router(cfg *Config) *gin.Engine {
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDLX("", targetLang, translateText, "", proxyURL, "")
+		result, err := translate.TranslateByDLXContext(c.Request.Context(), "", targetLang, translateText, "", proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{

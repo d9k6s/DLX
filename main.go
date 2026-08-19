@@ -14,6 +14,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/gin-gonic/gin"
 
@@ -30,5 +31,7 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 
 	app := service.Router(cfg)
-	app.Run(fmt.Sprintf("%v:%v", cfg.IP, cfg.Port))
+	if err := app.Run(fmt.Sprintf("%v:%v", cfg.IP, cfg.Port)); err != nil {
+		log.Fatalf("DLX server stopped: %v", err)
+	}
 }
