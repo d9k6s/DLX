@@ -69,6 +69,25 @@ curl -X POST http://localhost:1188/translate \
   -d '{"text": "Hello, world!", "source_lang": "EN", "target_lang": "ZH"}'
 ```
 
+### Translation client profile
+
+DLX uses the upstream-compatible iOS request profile by default. To try the
+experimental Chrome extension profile, set `DL_CLIENT_PROFILE=chrome`:
+
+```yaml
+services:
+  deeplx:
+    environment:
+      DL_CLIENT_PROFILE: "chrome"
+```
+
+The Chrome profile keeps the same oneshot endpoint and authorization contract,
+but sends Chrome extension `app_information`, omits the iOS-only `x-app-*`
+headers and cookie warm-up, and uses the Chrome TLS/HTTP2 fingerprint available
+in the pinned HTTP client. Set the value back to `ios` to roll back. Because
+the bundled fingerprint may lag current Chrome releases, this mode is
+experimental and should be canary-tested at low request volume.
+
 ### DeepL Pro OAuth token lifecycle
 
 `/v1/translate` uses a DeepL Pro OAuth access token. A static access token can

@@ -19,19 +19,21 @@ import (
 )
 
 type Config struct {
-	IP             string
-	Port           int
-	Token          string
-	DlSession      string
-	DlRefreshToken string
-	DlTokenStore   string
-	Proxy          string
+	IP              string
+	Port            int
+	Token           string
+	DlSession       string
+	DlRefreshToken  string
+	DlTokenStore    string
+	DlClientProfile string
+	Proxy           string
 }
 
 func InitConfig() *Config {
 	cfg := &Config{
-		IP:   "0.0.0.0",
-		Port: 1188,
+		IP:              "0.0.0.0",
+		Port:            1188,
+		DlClientProfile: "ios",
 	}
 
 	// IP flag
@@ -65,6 +67,12 @@ func InitConfig() *Config {
 	// Optional state file used to persist rotated OAuth tokens across restarts.
 	if dlTokenStore, ok := os.LookupEnv("DL_TOKEN_STORE"); ok {
 		cfg.DlTokenStore = dlTokenStore
+	}
+
+	// Translation transport identity. Keep iOS as the compatibility default;
+	// Chrome is an experimental approximation of the official extension.
+	if dlClientProfile, ok := os.LookupEnv("DL_CLIENT_PROFILE"); ok && dlClientProfile != "" {
+		cfg.DlClientProfile = dlClientProfile
 	}
 
 	// Access token flag

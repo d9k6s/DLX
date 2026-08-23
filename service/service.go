@@ -120,6 +120,13 @@ func Router(cfg *Config) *gin.Engine {
 		fmt.Println("[DLX API] access token protection is enabled.")
 	}
 
+	clientProfile, clientProfileErr := translate.ParseClientProfile(cfg.DlClientProfile)
+	if clientProfileErr != nil {
+		log.Printf("[DeepL] %v; falling back to the iOS client profile.", clientProfileErr)
+		clientProfile = translate.ClientProfileIOS
+	}
+	log.Printf("[DeepL] translation client profile is %s.", clientProfile)
+
 	proTokens, proTokenInitErr := newProTokenManager(cfg)
 	if proTokenInitErr != nil {
 		log.Printf("Failed to load DeepL OAuth token state: %v", proTokenInitErr)
@@ -168,7 +175,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDLXContextWithProfile(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, "", clientProfile)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -252,7 +259,7 @@ func Router(cfg *Config) *gin.Engine {
 		}
 
 		translateWithToken := func(token string) (translate.DLXTranslationResult, error) {
-			return translate.TranslateByDLXContext(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, token)
+			return translate.TranslateByDLXContextWithProfile(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, token, clientProfile)
 		}
 		result, err := translateWithToken(dlSession)
 		if err != nil {
@@ -329,7 +336,7 @@ func Router(cfg *Config) *gin.Engine {
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDLXContext(c.Request.Context(), "", targetLang, translateText, "", proxyURL, "")
+		result, err := translate.TranslateByDLXContextWithProfile(c.Request.Context(), "", targetLang, translateText, "", proxyURL, "", clientProfile)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{

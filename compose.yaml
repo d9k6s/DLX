@@ -9,6 +9,7 @@ services:
     #   DL_SESSION: "replace-with-the-current-DeepL-access-token"
     #   DL_REFRESH_TOKEN: "replace-with-the-DeepL-refresh-token"
     #   DL_TOKEN_STORE: "/data/deepl-oauth.json"
+    #   DL_CLIENT_PROFILE: "chrome"
     volumes:
       - deeplx-oauth:/data
 

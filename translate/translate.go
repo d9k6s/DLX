@@ -42,8 +42,10 @@ import (
 // traffic hard; oneshot lives on a separate pool and accepts the literal
 // header `Authorization: None` for free requests.
 //
-// Request shape reverse-engineered from DeepL iOS 26.42 (build 5443737,
-// bundle com.linguee.DeepLMobileTranslator, IPA Info.plist + ItaClient.framework):
+// Request profiles are reverse-engineered from DeepL iOS 26.42 and the
+// official Chrome extension 1.97.0. Both use the same oneshot endpoint and
+// JSON contract, but their transport, headers, cookies, and app_information
+// identity must not be mixed.
 //
 //	Transport
 //	  ItaClient oneshot uses Ktor Darwin engine
@@ -67,9 +69,13 @@ import (
 //	  usage_type ∈ {translate, ocr, voiceforconversations}
 //
 // DeepL rate-limits / temporarily bans clients whose TLS + UA + app_information
-// story is inconsistent (e.g. iOS TLS fingerprint + "iOS 27.0" in the UA when
-// 27 is not a shipping OS). Keep every field on one coherent iOS profile.
+// story is inconsistent. Keep every field on one coherent client profile.
+type ClientProfile string
+
 const (
+	ClientProfileIOS    ClientProfile = "ios"
+	ClientProfileChrome ClientProfile = "chrome"
+
 	oneshotFreeEndpoint = "https://oneshot-free.www.deepl.com/v1/translate"
 	oneshotProEndpoint  = "https://oneshot-pro.www.deepl.com/v1/translate"
 
@@ -88,6 +94,16 @@ const (
 	// BuildMachineOSBuild 25E246 → Darwin 25).
 	iosCFNetworkVersion = "3826.600.41"
 	iosDarwinVersion    = "25.0.0"
+
+	// Chrome profile values are aligned with req/v3 v3.60.0's newest available
+	// Chrome ClientHello (utls HelloChrome_Auto = Chrome 133). The extension
+	// derives these fields from navigator and chrome.runtime at runtime.
+	chromeExtensionVersion = "1.97.0"
+	chromeBrowserMajor     = "133"
+	chromeBrowserVersion   = "133.0.0.0"
+	chromePlatform         = "macOS"
+	chromeAppBuild         = "chrome_web_store"
+	chromeExtensionOrigin  = "chrome-extension://cofdbpoegempjloogbagkncekinflcnj"
 
 	// oneshot enforces a 1500-character hard cap on the total length of
 	// the `text` array for anonymous traffic (same limit the Chrome
@@ -113,10 +129,20 @@ const (
 	maxOneshotResponseSize = 4 << 20
 )
 
-// instanceID mirrors the UUID the iOS app persists for analytics /
-// app_information.instance_id and x-app-instance-id: stable for the life
-// of the process, reused on every request. Rotating per-request is a
-// stronger bot signal than reusing one.
+func ParseClientProfile(value string) (ClientProfile, error) {
+	switch ClientProfile(strings.ToLower(strings.TrimSpace(value))) {
+	case "", ClientProfileIOS:
+		return ClientProfileIOS, nil
+	case ClientProfileChrome:
+		return ClientProfileChrome, nil
+	default:
+		return "", fmt.Errorf("unsupported DeepL client profile %q (supported: ios, chrome)", value)
+	}
+}
+
+// instanceID mirrors the stable installation/browser instance ID used by both
+// client profiles. It remains stable for the process lifetime and is reused on
+// every request; rotating it per request is a stronger bot signal.
 var instanceID = newInstanceID()
 
 // sessionID is sent as x-app-session-id (ClientInfos.appHeaders). Stable
@@ -133,8 +159,8 @@ var (
 	cookieWarmer  sync.Once
 )
 
-// oneshotClients caches one req.Client per proxy URL so all translate
-// calls share the underlying TCP / TLS / HTTP/2 connection pool.
+// oneshotClients caches one req.Client per profile and proxy URL so all
+// compatible calls share the underlying TCP / TLS / HTTP/2 connection pool.
 var oneshotClients sync.Map // map[string]*req.Client
 
 func sharedCookieJar() http.CookieJar {
@@ -303,8 +329,7 @@ func validateOneshotTextLength(text string, pro bool) error {
 	return nil
 }
 
-// appInformation matches ItaClient.AppInformation (os, os_version,
-// app_version, app_build, instance_id) as serialized by the iOS client.
+// appInformation is shared by the iOS and browser-extension oneshot bodies.
 type appInformation struct {
 	OS         string `json:"os"`
 	OSVersion  string `json:"os_version"`
@@ -313,9 +338,8 @@ type appInformation struct {
 	InstanceID string `json:"instance_id"`
 }
 
-// oneshotRequest mirrors the body assembled by the iOS OneShotTranslator
-// / ItaClient oneshot path. Field order matches the app's serialization
-// so the JSON is byte-stable (encoding/json honours struct field order).
+// oneshotRequest mirrors the body assembled by both interactive clients.
+// Field order stays byte-stable because encoding/json honours struct order.
 type oneshotRequest struct {
 	Text           []string       `json:"text"`
 	TargetLang     string         `json:"target_lang"`
@@ -324,41 +348,103 @@ type oneshotRequest struct {
 	AppInformation appInformation `json:"app_information"`
 }
 
+func appInformationForProfile(profile ClientProfile) (appInformation, error) {
+	switch profile {
+	case ClientProfileIOS:
+		return appInformation{
+			OS:         "iOS",
+			OSVersion:  iosOSVersion,
+			AppVersion: iosAppVersion,
+			AppBuild:   iosAppBuild,
+			InstanceID: instanceID,
+		}, nil
+	case ClientProfileChrome:
+		return appInformation{
+			OS:         "brex_" + chromePlatform,
+			OSVersion:  "brex_Chrome_" + chromeBrowserVersion,
+			AppVersion: chromeExtensionVersion,
+			AppBuild:   chromeAppBuild,
+			InstanceID: instanceID,
+		}, nil
+	default:
+		return appInformation{}, fmt.Errorf("unsupported DeepL client profile %q", profile)
+	}
+}
+
+func newOneshotRequest(profile ClientProfile, text, targetLang, sourceLang string) (oneshotRequest, error) {
+	appInfo, err := appInformationForProfile(profile)
+	if err != nil {
+		return oneshotRequest{}, err
+	}
+	return oneshotRequest{
+		Text:           []string{text},
+		TargetLang:     targetLang,
+		SourceLang:     sourceLang,
+		UsageType:      "translate",
+		AppInformation: appInfo,
+	}, nil
+}
+
+func oneshotClientCacheKey(profile ClientProfile, proxyURL string) string {
+	return string(profile) + "\x00" + proxyURL
+}
+
 // getOneshotClient returns a process-wide cached client for the given
 // proxy URL, creating it on first use. Sharing the client across
 // requests keeps the TLS / HTTP/2 connection in the pool.
-func getOneshotClient(proxyURL string) (*req.Client, error) {
-	if c, ok := oneshotClients.Load(proxyURL); ok {
+func getOneshotClient(profile ClientProfile, proxyURL string) (*req.Client, error) {
+	key := oneshotClientCacheKey(profile, proxyURL)
+	if c, ok := oneshotClients.Load(key); ok {
 		return c.(*req.Client), nil
 	}
-	c, err := newOneshotClient(proxyURL)
+	c, err := newOneshotClient(profile, proxyURL)
 	if err != nil {
 		return nil, err
 	}
-	if actual, loaded := oneshotClients.LoadOrStore(proxyURL, c); loaded {
+	if actual, loaded := oneshotClients.LoadOrStore(key, c); loaded {
 		return actual.(*req.Client), nil
 	}
-	go warmCookies(c)
+	if profile == ClientProfileIOS {
+		go warmCookies(c)
+	}
 	return c, nil
 }
 
-func newOneshotClient(proxyURL string) (*req.Client, error) {
-	// Match ItaClient's Ktor Darwin / URLSession profile:
-	//   - TLS ClientHello ≈ real iOS (utls HelloIOS_Auto)
-	//   - Cookie jar shared like URLSession's HTTPCookieStorage
-	//   - Common headers = what URLSession attaches by default
-	// Per-request headers (Authorization, x-app-*) are set in callOneshot.
-	client := req.C().
-		SetTLSFingerprintIOS().
-		SetCookieJar(sharedCookieJar()).
-		SetTimeout(oneshotTimeout).
-		SetUserAgent(iosUserAgent()).
-		// URLSession default Accept-Encoding for data tasks.
-		SetCommonHeader("Accept-Encoding", "gzip, deflate, br").
-		SetCommonHeader("Accept", "*/*").
-		// Preferred language list — mirrors a US-locale device; DeepL
-		// does not hard-require a specific value for free oneshot.
-		SetCommonHeader("Accept-Language", "en-US,en;q=0.9")
+func newOneshotClient(profile ClientProfile, proxyURL string) (*req.Client, error) {
+	var client *req.Client
+	switch profile {
+	case ClientProfileIOS:
+		client = req.C().
+			SetTLSFingerprintIOS().
+			SetCookieJar(sharedCookieJar()).
+			SetTimeout(oneshotTimeout).
+			SetUserAgent(iosUserAgent()).
+			SetCommonHeader("Accept-Encoding", "gzip, deflate, br").
+			SetCommonHeader("Accept", "*/*").
+			SetCommonHeader("Accept-Language", "en-US,en;q=0.9")
+	case ClientProfileChrome:
+		// ImpersonateChrome supplies Chrome-like HTTP/2 settings and header
+		// ordering. Replace its navigation headers with the subset emitted by
+		// a Manifest V3 service-worker JSON fetch, then move its ClientHello to
+		// the newest Chrome profile available in the pinned uTLS version.
+		client = req.C().ImpersonateChrome().SetTLSFingerprintChrome().SetCookieJar(nil)
+		client.Headers = make(http.Header)
+		client.SetTimeout(oneshotTimeout).
+			SetUserAgent(chromeUserAgent()).
+			SetCommonHeader("Accept-Encoding", "gzip, deflate, br").
+			SetCommonHeader("Accept", "*/*").
+			SetCommonHeader("Accept-Language", "en-US,en;q=0.9").
+			SetCommonHeader("Sec-CH-UA", fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%s", "Google Chrome";v="%s"`, chromeBrowserMajor, chromeBrowserMajor)).
+			SetCommonHeader("Sec-CH-UA-Mobile", "?0").
+			SetCommonHeader("Sec-CH-UA-Platform", `"`+chromePlatform+`"`).
+			SetCommonHeader("Origin", chromeExtensionOrigin).
+			SetCommonHeader("Sec-Fetch-Site", "cross-site").
+			SetCommonHeader("Sec-Fetch-Mode", "cors").
+			SetCommonHeader("Sec-Fetch-Dest", "empty").
+			SetCommonHeader("Priority", "u=1, i")
+	default:
+		return nil, fmt.Errorf("unsupported DeepL client profile %q", profile)
+	}
 
 	if proxyURL != "" {
 		u, err := url.Parse(proxyURL)
@@ -381,12 +467,19 @@ func iosUserAgent() string {
 	)
 }
 
+func chromeUserAgent() string {
+	return fmt.Sprintf(
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36",
+		chromeBrowserVersion,
+	)
+}
+
 // callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
 // that header puts the request on a different server-side auth branch.
-func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
-	client, err := getOneshotClient(proxyURL)
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL string, profile ClientProfile) (gjson.Result, int, error) {
+	client, err := getOneshotClient(profile, proxyURL)
 	if err != nil {
 		return gjson.Result{}, 0, err
 	}
@@ -397,19 +490,20 @@ func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken,
 		authValue = "Bearer " + bearerToken
 	}
 
-	resp, err := client.R().
+	request := client.R().
 		SetContext(ctx).
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
-		SetHeader("Authorization", authValue).
-		// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
-		// x-app-* keys exist in the iOS binary.
-		SetHeader("x-app-os-version", iosOSVersion).
-		SetHeader("x-app-instance-id", instanceID).
-		SetHeader("x-app-session-id", sessionID).
-		SetBodyBytes(body). // pins Content-Length; an io.Reader would
-		// force Transfer-Encoding: chunked, which URLSession JSON bodies
-		// never emit.
+		SetHeader("Authorization", authValue)
+	if profile == ClientProfileIOS {
+		request.
+			SetHeader("x-app-os-version", iosOSVersion).
+			SetHeader("x-app-instance-id", instanceID).
+			SetHeader("x-app-session-id", sessionID)
+	}
+	resp, err := request.
+		SetBodyBytes(body). // Both clients send a fixed-length JSON body;
+		// an io.Reader would force Transfer-Encoding: chunked.
 		Post(endpoint)
 	if err != nil {
 		return gjson.Result{}, 0, err
@@ -456,6 +550,12 @@ func TranslateByDLX(sourceLang, targetLang, text string, tagHandling string, pro
 // to the upstream request. HTTP handlers should use this form so disconnected
 // clients do not leave a DeepL request consuming resources until timeout.
 func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
+	return TranslateByDLXContextWithProfile(ctx, sourceLang, targetLang, text, tagHandling, proxyURL, dlSession, ClientProfileIOS)
+}
+
+// TranslateByDLXContextWithProfile performs oneshot translation with an
+// explicitly selected interactive-client transport profile.
+func TranslateByDLXContextWithProfile(ctx context.Context, sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string, profile ClientProfile) (DLXTranslationResult, error) {
 	if text == "" {
 		return DLXTranslationResult{
 			Code:    http.StatusNotFound,
@@ -490,19 +590,12 @@ func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang, text str
 	// official v2 API does — ignored upstream.
 	_ = tagHandling
 
-	reqStruct := oneshotRequest{
-		Text:       []string{text},
-		TargetLang: resolvedTarget,
-		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
-		// ItaClient.OneShotUsageType.translate (also: ocr, voiceforconversations)
-		UsageType: "translate",
-		AppInformation: appInformation{
-			OS:         "iOS",
-			OSVersion:  iosOSVersion,
-			AppVersion: iosAppVersion,
-			AppBuild:   iosAppBuild,
-			InstanceID: instanceID,
-		},
+	reqStruct, err := newOneshotRequest(profile, text, resolvedTarget, resolvedSource)
+	if err != nil {
+		return DLXTranslationResult{
+			Code:    http.StatusInternalServerError,
+			Message: err.Error(),
+		}, nil
 	}
 	bodyBytes, _ := json.Marshal(reqStruct)
 
@@ -512,7 +605,7 @@ func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang, text str
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL)
+	result, status, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL, profile)
 	if err != nil {
 		// Map upstream timeouts to 504 so callers can distinguish "DeepL
 		// took too long" from other 503 failure modes (DNS, TLS, etc.).
