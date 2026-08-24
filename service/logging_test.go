@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/OwO-Network/DLX/translate"
 )
 
 func TestRedactSensitiveQuery(t *testing.T) {
@@ -61,5 +63,27 @@ func TestSafeGinLogFormatterDoesNotExposeQueryToken(t *testing.T) {
 	}
 	if !strings.Contains(line, "/v1/translate?token=REDACTED") {
 		t.Fatalf("request log does not contain redaction marker: %s", line)
+	}
+}
+
+func TestTranslationClientModeLog(t *testing.T) {
+	tests := []struct {
+		profile translate.ClientProfile
+		want    string
+	}{
+		{
+			profile: translate.ClientProfileIOS,
+			want:    "[DLX] translation client mode is iOS (DL_CLIENT_PROFILE=ios).",
+		},
+		{
+			profile: translate.ClientProfileChrome,
+			want:    "[DLX] translation client mode is Chrome (DL_CLIENT_PROFILE=chrome).",
+		},
+	}
+
+	for _, test := range tests {
+		if got := translationClientModeLog(test.profile); got != test.want {
+			t.Errorf("translationClientModeLog(%q) = %q, want %q", test.profile, got, test.want)
+		}
 	}
 }

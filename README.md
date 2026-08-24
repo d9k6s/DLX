@@ -53,6 +53,10 @@ Or use the provided [`compose.yaml`](compose.yaml):
 docker compose up -d
 ```
 
+The repository Docker workflow publishes `main` as `latest` and publishes the
+`dev` branch as the separate `dev` tag. Both branches also receive an immutable
+short-SHA tag, while `dev` never overwrites `latest`.
+
 ### Binary
 
 Download the binary for your platform from [Releases](https://github.com/OwO-Network/DLX/releases) and run it (artifact names remain `deeplx_*`):
@@ -87,6 +91,13 @@ headers and cookie warm-up, and uses the Chrome TLS/HTTP2 fingerprint available
 in the pinned HTTP client. Set the value back to `ios` to roll back. Because
 the bundled fingerprint may lag current Chrome releases, this mode is
 experimental and should be canary-tested at low request volume.
+
+The selected mode is printed once during startup and is visible through
+`docker logs`. For example:
+
+```text
+[DLX] translation client mode is Chrome (DL_CLIENT_PROFILE=chrome).
+```
 
 ### DeepL Pro OAuth token lifecycle
 

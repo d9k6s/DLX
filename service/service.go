@@ -115,6 +115,15 @@ func safeGinLogFormatter(param gin.LogFormatterParams) string {
 	)
 }
 
+func translationClientModeLog(profile translate.ClientProfile) string {
+	mode := "iOS"
+	if profile == translate.ClientProfileChrome {
+		mode = "Chrome"
+	}
+
+	return fmt.Sprintf("[DLX] translation client mode is %s (DL_CLIENT_PROFILE=%s).", mode, profile)
+}
+
 func Router(cfg *Config) *gin.Engine {
 	if cfg.Token != "" {
 		fmt.Println("[DLX API] access token protection is enabled.")
@@ -125,7 +134,7 @@ func Router(cfg *Config) *gin.Engine {
 		log.Printf("[DeepL] %v; falling back to the iOS client profile.", clientProfileErr)
 		clientProfile = translate.ClientProfileIOS
 	}
-	log.Printf("[DeepL] translation client profile is %s.", clientProfile)
+	log.Print(translationClientModeLog(clientProfile))
 
 	proTokens, proTokenInitErr := newProTokenManager(cfg)
 	if proTokenInitErr != nil {
