@@ -1,8 +1,10 @@
 package translate
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -170,6 +172,113 @@ func TestCallOneshotRejectsOversizedResponse(t *testing.T) {
 	_, _, err := callOneshot(context.Background(), server.URL, []byte(`{}`), "", cacheTestClient(t, ClientProfileIOS), ClientProfileIOS)
 	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
 		t.Fatalf("callOneshot error = %v, want response size error", err)
+	}
+}
+
+func TestFormatUpstreamDiagnosticIncludesMetadataWithoutSensitiveValues(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("Retry-After", "120")
+	headers.Set("X-Request-ID", "request-123")
+	headers.Set("X-Trace-ID", "trace-456")
+	headers.Set("CF-Ray", "ray-789-TPE")
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Set-Cookie", "session=header-secret")
+	raw := []byte(`{"code":429,"message":"reflected-user-secret","token":"body-secret"}`)
+
+	got := formatUpstreamDiagnostic(
+		http.StatusTooManyRequests,
+		ClientProfileChrome,
+		true,
+		true,
+		"HTTP/2.0",
+		headers,
+		raw,
+	)
+
+	for _, want := range []string{
+		"status=429",
+		"profile=chrome",
+		"tier=pro",
+		"via_proxy=true",
+		`proto="HTTP/2.0"`,
+		`retry_after="120"`,
+		`request_id="request-123"`,
+		`trace_id="trace-456"`,
+		`cf_ray="ray-789-TPE"`,
+		`content_type="application/json"`,
+		"body_json=true",
+		`json_fields="code,message"`,
+		"unknown_json_fields=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("diagnostic log %q does not contain %q", got, want)
+		}
+	}
+	for _, secret := range []string{"header-secret", "reflected-user-secret", "body-secret", "token"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("diagnostic log leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestCallOneshotLogsSafeDiagnosticFor429(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		w.Header().Set("X-Request-ID", "upstream-request")
+		w.Header().Set("Set-Cookie", "session=header-secret")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"reflected-user-secret","private":"body-secret"}`))
+	}))
+	defer server.Close()
+
+	var output bytes.Buffer
+	previousWriter := log.Writer()
+	previousFlags := log.Flags()
+	previousPrefix := log.Prefix()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	t.Cleanup(func() {
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		log.SetPrefix(previousPrefix)
+	})
+
+	_, status, err := callOneshot(
+		context.Background(),
+		server.URL,
+		[]byte(`{"text":["request-secret"]}`),
+		"",
+		cacheTestClient(t, ClientProfileIOS),
+		ClientProfileIOS,
+	)
+	if err != nil {
+		t.Fatalf("callOneshot() error = %v", err)
+	}
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("callOneshot() status = %d, want 429", status)
+	}
+
+	got := output.String()
+	for _, want := range []string{
+		"[DeepL upstream] status=429",
+		"profile=ios",
+		"tier=free",
+		"via_proxy=true",
+		`retry_after="60"`,
+		`request_id="upstream-request"`,
+		`json_fields="message"`,
+		"unknown_json_fields=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("429 log %q does not contain %q", got, want)
+		}
+	}
+	for _, secret := range []string{"request-secret", "header-secret", "reflected-user-secret", "body-secret", "private"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("429 log leaked %q: %s", secret, got)
+		}
 	}
 }
 

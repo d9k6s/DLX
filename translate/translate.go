@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -474,6 +475,78 @@ func chromeUserAgent() string {
 	)
 }
 
+const maxDiagnosticHeaderLength = 160
+
+var diagnosticJSONFields = map[string]struct{}{
+	"code":         {},
+	"detail":       {},
+	"error":        {},
+	"errors":       {},
+	"message":      {},
+	"status":       {},
+	"title":        {},
+	"translations": {},
+	"type":         {},
+}
+
+// boundedDiagnosticHeader keeps selected upstream metadata useful without
+// allowing an unexpectedly large or multiline header to forge log entries.
+func boundedDiagnosticHeader(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > maxDiagnosticHeaderLength {
+		value = value[:maxDiagnosticHeaderLength] + "..."
+	}
+	return value
+}
+
+// diagnosticResponseShape records only the presence of known JSON fields.
+// Values and unknown field names are deliberately omitted because an upstream
+// error response could reflect translated text, credentials, or other input.
+func diagnosticResponseShape(raw []byte) (bool, string, int) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return false, "", 0
+	}
+
+	fields := make([]string, 0, len(object))
+	unknownFields := 0
+	for field := range object {
+		if _, ok := diagnosticJSONFields[field]; ok {
+			fields = append(fields, field)
+		} else {
+			unknownFields++
+		}
+	}
+	sort.Strings(fields)
+	return true, strings.Join(fields, ","), unknownFields
+}
+
+func formatUpstreamDiagnostic(status int, profile ClientProfile, authenticated, viaProxy bool, proto string, headers http.Header, raw []byte) string {
+	tier := "free"
+	if authenticated {
+		tier = "pro"
+	}
+	isJSON, jsonFields, unknownJSONFields := diagnosticResponseShape(raw)
+
+	return fmt.Sprintf(
+		"[DeepL upstream] status=%d profile=%s tier=%s via_proxy=%t proto=%q retry_after=%q request_id=%q trace_id=%q cf_ray=%q content_type=%q body_bytes=%d body_json=%t json_fields=%q unknown_json_fields=%d",
+		status,
+		profile,
+		tier,
+		viaProxy,
+		boundedDiagnosticHeader(proto),
+		boundedDiagnosticHeader(headers.Get("Retry-After")),
+		boundedDiagnosticHeader(headers.Get("X-Request-ID")),
+		boundedDiagnosticHeader(headers.Get("X-Trace-ID")),
+		boundedDiagnosticHeader(headers.Get("CF-Ray")),
+		boundedDiagnosticHeader(headers.Get("Content-Type")),
+		len(raw),
+		isJSON,
+		jsonFields,
+		unknownJSONFields,
+	)
+}
+
 // callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
@@ -534,6 +607,17 @@ func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken,
 	}
 	if len(raw) > maxOneshotResponseSize {
 		return gjson.Result{}, resp.StatusCode, fmt.Errorf("upstream response exceeds %d bytes", maxOneshotResponseSize)
+	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		log.Print(formatUpstreamDiagnostic(
+			resp.StatusCode,
+			profile,
+			bearerToken != "",
+			proxyURL != "",
+			resp.Proto,
+			resp.Header,
+			raw,
+		))
 	}
 	return gjson.ParseBytes(raw), resp.StatusCode, nil
 }
